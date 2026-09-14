@@ -1,689 +1,588 @@
-"""
-Comic-Skript-Generator
-======================
+#!/usr/bin/env python3.10
+"""Comic Maker - Gradio-Oberfläche für eine Comic-Seite mit 4 bis 6 Panels.
 
-Eine kleine Gradio-Oberflaeche fuer den MINT-Kurs, in zwei Schritten:
-
-Reiter "Figuren"  Die Teilnehmerinnen beschreiben bis zu drei Figuren, das
-                  Setting, die Startszene und das Ziel der Szene. Daraus erzeugt
-                  ein lokal laufender Ollama-Server ein Skript fuer eine
-                  Comicseite mit 4 bis 6 Panels.
-Reiter "Panels"   Das Skript wird auf einzelne Panel-Textboxen verteilt. Jedes
-                  Panel kann bearbeitet und ueber einen laufenden Fooocus-Server
-                  in ein Bild verwandelt werden.
-
-Das Verhalten der beiden Server (der "versteckte Kontext") wird komplett ueber
-die .env-Datei konfiguriert, siehe .env.example.
+Gedacht für einen MINT-Kurs mit Mädchen ab 12 Jahren. Die Oberfläche
+führt in sechs Tabs durch den Ablauf:
+Creator -> Characters -> Scene -> Script -> Page -> Export
 """
 
 from __future__ import annotations
 
-import os
-import re
-import json
-import queue
-import threading
-from dataclasses import dataclass, field
+from typing import List
 
 import gradio as gr
-import requests
-from dotenv import load_dotenv
 
-import fooocus_client
-
-# ---------------------------------------------------------------------------
-# Konfiguration aus .env
-# ---------------------------------------------------------------------------
-
-load_dotenv()  # laedt .env aus dem Arbeitsverzeichnis, ueberschreibt keine echten ENV-Variablen
-
-
-def _env(name: str, default: str = "") -> str:
-    value = os.getenv(name)
-    return default if value is None else value
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(str(_env(name, str(default))).strip())
-    except ValueError:
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(str(_env(name, str(default))).strip())
-    except ValueError:
-        return default
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    return str(_env(name, str(default))).strip().lower() in {"1", "true", "yes", "ja", "on"}
-
-
-DEFAULT_SYSTEM_CONTEXT = """\
-Du bist eine erfahrene Comic-Autorin und schreibst gemeinsam mit Maedchen im \
-Alter von 12 Jahren ein Comic-Skript. Du antwortest ausschliesslich auf Deutsch, \
-in einfacher, lebendiger und altersgerechter Sprache.
-
-Regeln:
-- Die Geschichte ist freundlich, mutmachend und altersgerecht (keine Gewalt, \
-keine Angst machenden oder unpassenden Inhalte, keine Werbung, keine Romantik).
-- Du erfindest nur Figuren, die vorgegeben wurden, und nennst sie immer bei ihrem Namen.
-- Die Bildbeschreibungen sind konkret und zeichenbar: Bildausschnitt (z.B. Nahaufnahme, \
-Totale), Ort, Handlung, Mimik, Farben und Stimmung.
-- Die Erzaehltexte sind kurz (maximal zwei Saetze) und treiben die Geschichte voran.
-- Die Dialoge sind kurz, natuerlich und passen zur jeweiligen Figur.
-- Das Panel 1 zeigt die Startszene, das letzte Panel erreicht das Ziel der Szene.
-- Du gibst nur das fertige Skript aus, keine Erklaerungen, keine Einleitung, \
-keine Rueckfragen und keine Markdown-Codebloecke.\
-"""
-
-DEFAULT_PROMPT_TEMPLATE = """\
-Schreibe ein Skript fuer EINE Comicseite mit genau {panel_count} Panels.
-
-FIGUREN:
-{characters}
-
-SETTING (Ort, Zeit, Stimmung):
-{setting}
-
-STARTSZENE (so beginnt die Seite):
-{start_scene}
-
-ZIEL DER SZENE (so endet die Seite):
-{goal}
-
-Gib das Ergebnis exakt in diesem Format aus, fuer jedes Panel von 1 bis {panel_count}:
-
-PANEL <Nummer>
-BILD: <ausfuehrliche Beschreibung des Bildes>
-TEXT: <Erzaehltext der Textbox, 1-2 Saetze>
-DIALOG:
-<Figurenname>: <was die Figur sagt>
-<Figurenname>: <was die Figur sagt>
-
-Wenn in einem Panel niemand spricht, schreibe unter DIALOG die Zeile "(kein Dialog)".
-Verwende zwischen den Panels eine Leerzeile.\
-"""
-
-DEFAULT_CHARACTER_LINE = "- {name}: {description}"
-
-DEFAULT_TRANSLATION_PROMPT = """\
-Du uebersetzt Bildbeschreibungen aus einem Comic-Skript vom Deutschen ins Englische, \
-damit ein Bildgenerator sie versteht. Behalte alle Namen, Details, Farben, Kameraeinstellungen \
-und Stimmungen bei. Antworte ausschliesslich mit der englischen Uebersetzung - ohne \
-Anfuehrungszeichen, ohne Einleitung und ohne Erklaerung.\
-"""
-
-
-@dataclass
-class Config:
-    """Alle Einstellungen, die ueber die .env-Datei gesteuert werden."""
-
-    ollama_url: str = field(default_factory=lambda: _env("OLLAMA_URL", "http://localhost:11434"))
-    model: str = field(default_factory=lambda: _env("OLLAMA_MODEL", "gemma4:latest"))
-    timeout: int = field(default_factory=lambda: _env_int("OLLAMA_TIMEOUT", 300))
-    temperature: float = field(default_factory=lambda: _env_float("OLLAMA_TEMPERATURE", 0.8))
-    top_p: float = field(default_factory=lambda: _env_float("OLLAMA_TOP_P", 0.9))
-    num_ctx: int = field(default_factory=lambda: _env_int("OLLAMA_NUM_CTX", 8192))
-    num_predict: int = field(default_factory=lambda: _env_int("OLLAMA_NUM_PREDICT", 2048))
-
-    # Der "versteckte Kontext": Systemprompt + Vorlage fuer die eigentliche Anfrage.
-    system_context: str = field(default_factory=lambda: _env("SYSTEM_CONTEXT", DEFAULT_SYSTEM_CONTEXT))
-    prompt_template: str = field(default_factory=lambda: _env("PROMPT_TEMPLATE", DEFAULT_PROMPT_TEMPLATE))
-    character_line: str = field(default_factory=lambda: _env("CHARACTER_LINE_TEMPLATE", DEFAULT_CHARACTER_LINE))
-
-    # Bildbeschreibungen vor der Bildgenerierung ins Englische uebersetzen.
-    # Bildmodelle verstehen Deutsch kaum, ohne diesen Schritt passt das Bild
-    # meist nicht zum Panel.
-    translate_image_prompt: bool = field(
-        default_factory=lambda: _env_bool("TRANSLATE_IMAGE_PROMPT", True)
-    )
-    translation_system_prompt: str = field(
-        default_factory=lambda: _env("TRANSLATION_SYSTEM_PROMPT", DEFAULT_TRANSLATION_PROMPT)
-    )
-
-    # Oberflaeche
-    app_title: str = field(default_factory=lambda: _env("APP_TITLE", "Comic-Werkstatt"))
-    app_subtitle: str = field(
-        default_factory=lambda: _env(
-            "APP_SUBTITLE",
-            "Erfinde deine Figuren, beschreibe die Szene - und lass dein Comic-Skript schreiben!",
-        )
-    )
-    min_panels: int = field(default_factory=lambda: _env_int("MIN_PANELS", 4))
-    max_panels: int = field(default_factory=lambda: _env_int("MAX_PANELS", 6))
-    default_panels: int = field(default_factory=lambda: _env_int("DEFAULT_PANELS", 5))
-
-    # Server
-    server_name: str = field(default_factory=lambda: _env("SERVER_NAME", "127.0.0.1"))
-    server_port: int = field(default_factory=lambda: _env_int("SERVER_PORT", 7860))
-    share: bool = field(default_factory=lambda: _env_bool("SHARE", False))
-
-
-CONFIG = Config()
-FOOOCUS = fooocus_client.FooocusConfig()
+import config
+import export_handler
+import image_handler
+import llm_handler
+from llm_handler import Character, Panel
 
 MAX_CHARACTERS = 3
+PANEL_SLOTS = config.MAX_PANELS  # 6 vorbereitete Panel-Karten
 
+TAB_CREATOR, TAB_CHARACTERS, TAB_SCENE, TAB_SCRIPT, TAB_PAGE, TAB_EXPORT = range(6)
 
-# ---------------------------------------------------------------------------
-# Hilfsfunktionen
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------- Beispieldaten
 
-_PLACEHOLDER = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+CHARACTER_PRESETS = [
+    ("Lina",
+     "12 Jahre, braune Zöpfe, blauer Laborkittel, gelbe Schutzbrille auf der Stirn, "
+     "Tablet unter dem Arm",
+     "neugierige Forscherin, probiert alles selbst aus"),
+    ("Robo-X",
+     "kleiner runder Roboter, mint-grünes Metall, ein großes Kameraauge, "
+     "Räder statt Beine, kleine Greifarme",
+     "hilfsbereiter Roboter, rechnet blitzschnell"),
+    ("Yara",
+     "13 Jahre, schwarze Locken mit rotem Stirnband, Jeanslatzhose voller Werkzeug, "
+     "Lupe an einer Kette",
+     "mutige Technikerin, baut und repariert gerne"),
+]
 
+SCENE_PRESET = (
+    "Ein modernes Schul-Labor mit bunten Flüssigkeiten, Mikroskopen und Computern. "
+    "Durch die großen Fenster fällt Nachmittagssonne.",
+    "Lina entdeckt eine seltsame leuchtende Formel an der Tafel, die niemand "
+    "geschrieben hat.",
+    "Lina, Robo-X und Yara lösen gemeinsam das Rätsel und starten das Experiment "
+    "erfolgreich - es leuchtet in allen Farben.",
+)
 
-def fill_template(template: str, values: dict) -> str:
-    """Ersetzt {platzhalter} in einer Vorlage.
+STYLE_PRESET = (
+    "freundlicher moderner Comic-Stil, klare schwarze Konturen, leuchtende Farben, "
+    "große ausdrucksstarke Augen, saubere Sprechblasen mit gut lesbarer Schrift"
+)
 
-    Bewusst nicht str.format(): unbekannte geschweifte Klammern in der Vorlage
-    (z.B. in einem Beispielformat) bleiben unveraendert stehen, statt einen
-    Fehler auszuloesen.
-    """
+WELCOME = """
+# Willkommen beim Comic Maker!
 
-    def replace(match: re.Match) -> str:
-        key = match.group(1)
-        return str(values[key]) if key in values else match.group(0)
+Erstelle deine eigene Comic-Seite in **6 einfachen Schritten**:
 
-    return _PLACEHOLDER.sub(replace, template)
+| Schritt | Tab | Was passiert hier? |
+|---|---|---|
+| 1 | **Creator** | Dein Künstlername, dein Kürzel und dein Signatur-Logo |
+| 2 | **Characters** | Wer kommt in deinem Comic vor? |
+| 3 | **Scene** | Wo spielt die Geschichte, wie fängt sie an, wie endet sie? |
+| 4 | **Script** | Der Computer schreibt das Drehbuch - du darfst alles ändern |
+| 5 | **Page** | Deine Comic-Seite wird gezeichnet |
+| 6 | **Export** | Speichern und ausdrucken |
 
-
-def clean_output(text: str) -> str:
-    """Entfernt Denk-Bloecke und Markdown-Codefences aus der Modellantwort."""
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"^\s*```[a-zA-Z]*\s*\n", "", text)
-    text = re.sub(r"\n\s*```\s*$", "", text)
-    return text.strip()
-
-
-def build_character_block(characters: list) -> str:
-    """Baut den Figuren-Abschnitt fuer den Prompt. characters: [(name, beschreibung), ...]"""
-    lines = []
-    for name, description in characters:
-        name = (name or "").strip()
-        description = (description or "").strip()
-        if not name:
-            continue
-        if not description:
-            description = "keine weitere Beschreibung"
-        lines.append(fill_template(CONFIG.character_line, {"name": name, "description": description}))
-    return "\n".join(lines)
-
-
-def build_prompt(characters: list, setting: str, start_scene: str, goal: str, panel_count: int) -> str:
-    """Setzt den sichtbaren Teil der Anfrage aus den Eingaben der Kinder zusammen."""
-    names = [n.strip() for n, _ in characters if (n or "").strip()]
-    return fill_template(
-        CONFIG.prompt_template,
-        {
-            "panel_count": panel_count,
-            "characters": build_character_block(characters),
-            "character_names": ", ".join(names),
-            "setting": (setting or "").strip(),
-            "start_scene": (start_scene or "").strip(),
-            "goal": (goal or "").strip(),
-        },
-    )
-
-
-def validate(characters: list, setting: str, start_scene: str, goal: str) -> list:
-    """Gibt eine Liste von Fehlermeldungen in deutscher Sprache zurueck."""
-    errors = []
-    if not any((n or "").strip() for n, _ in characters):
-        errors.append("Bitte gib mindestens einer Figur einen Namen.")
-    for index, (name, description) in enumerate(characters, start=1):
-        if (description or "").strip() and not (name or "").strip():
-            errors.append(f"Figur {index} hat eine Beschreibung, aber keinen Namen.")
-    if not (setting or "").strip():
-        errors.append("Bitte beschreibe das Setting der Szene.")
-    if not (start_scene or "").strip():
-        errors.append("Bitte beschreibe die Startszene.")
-    if not (goal or "").strip():
-        errors.append("Bitte beschreibe das Ziel der Szene.")
-    return errors
-
-
-# ---------------------------------------------------------------------------
-# Ollama
-# ---------------------------------------------------------------------------
-
-
-def stream_ollama(system_context: str, prompt: str):
-    """Ruft /api/chat auf und liefert die Antwort stueckweise (Generator)."""
-    payload = {
-        "model": CONFIG.model,
-        "messages": [
-            {"role": "system", "content": system_context},
-            {"role": "user", "content": prompt},
-        ],
-        "stream": True,
-        "options": {
-            "temperature": CONFIG.temperature,
-            "top_p": CONFIG.top_p,
-            "num_ctx": CONFIG.num_ctx,
-            "num_predict": CONFIG.num_predict,
-        },
-    }
-
-    url = CONFIG.ollama_url.rstrip("/") + "/api/chat"
-    with requests.post(url, json=payload, stream=True, timeout=CONFIG.timeout) as response:
-        response.raise_for_status()
-        for line in response.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            try:
-                chunk = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if chunk.get("error"):
-                raise RuntimeError(chunk["error"])
-            yield chunk.get("message", {}).get("content", "")
-            if chunk.get("done"):
-                break
-
-
-def ask_ollama(system_context: str, prompt: str) -> str:
-    """Einzelner Aufruf ohne Streaming, z.B. fuer die Uebersetzung."""
-    payload = {
-        "model": CONFIG.model,
-        "messages": [
-            {"role": "system", "content": system_context},
-            {"role": "user", "content": prompt},
-        ],
-        "stream": False,
-        "options": {"temperature": 0.2, "num_ctx": CONFIG.num_ctx},
-    }
-    url = CONFIG.ollama_url.rstrip("/") + "/api/chat"
-    response = requests.post(url, json=payload, timeout=CONFIG.timeout)
-    response.raise_for_status()
-    return clean_output(response.json().get("message", {}).get("content", ""))
-
-
-def check_ollama() -> str:
-    """Kurzer Statustext fuer die Oberflaeche."""
-    url = CONFIG.ollama_url.rstrip("/") + "/api/tags"
-    try:
-        response = requests.get(url, timeout=5)
-        response.raise_for_status()
-        models = [m.get("name", "") for m in response.json().get("models", [])]
-    except requests.RequestException:
-        return f"Ollama ist unter {CONFIG.ollama_url} nicht erreichbar."
-    if CONFIG.model in models:
-        return f"Bereit - Modell `{CONFIG.model}` laeuft auf {CONFIG.ollama_url}."
-    return (
-        f"Ollama laeuft, aber das Modell `{CONFIG.model}` wurde nicht gefunden. "
-        f"Verfuegbar sind z.B.: {', '.join(models[:5]) or 'keine'}."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Callback fuer den Button
-# ---------------------------------------------------------------------------
-
-
-def generate_script(
-    name1, desc1, name2, desc2, name3, desc3, setting, start_scene, goal, panel_count
-):
-    characters = [(name1, desc1), (name2, desc2), (name3, desc3)]
-    panel_count = int(panel_count)
-
-    errors = validate(characters, setting, start_scene, goal)
-    if errors:
-        yield "", "Da fehlt noch etwas:\n\n" + "\n".join(f"- {e}" for e in errors)
-        return
-
-    prompt = build_prompt(characters, setting, start_scene, goal, panel_count)
-
-    yield "", f"Das Skript wird geschrieben ... (Modell: {CONFIG.model})"
-
-    collected = ""
-    try:
-        for piece in stream_ollama(CONFIG.system_context, prompt):
-            collected += piece
-            yield clean_output(collected), "Das Skript wird geschrieben ..."
-    except requests.exceptions.ConnectionError:
-        yield "", f"Der Ollama-Server unter {CONFIG.ollama_url} ist nicht erreichbar."
-        return
-    except requests.exceptions.Timeout:
-        yield clean_output(collected), "Zeitueberschreitung - der Server hat zu lange gebraucht."
-        return
-    except requests.exceptions.HTTPError as error:
-        detail = ""
-        if error.response is not None:
-            detail = error.response.text[:300]
-        yield "", f"Fehler vom Ollama-Server: {error}. {detail}"
-        return
-    except (requests.RequestException, RuntimeError) as error:
-        yield clean_output(collected), f"Fehler bei der Verbindung zu Ollama: {error}"
-        return
-
-    result = clean_output(collected)
-    if not result:
-        yield "", "Das Modell hat leider nichts geliefert. Bitte versuche es noch einmal."
-        return
-
-    yield result, "Fertig! Du kannst das Skript jetzt lesen und direkt im Textfeld aendern."
-
-
-# ---------------------------------------------------------------------------
-# Reiter "Panels": Skript zerlegen und Bilder erzeugen
-# ---------------------------------------------------------------------------
-
-_PANEL_HEADING = re.compile(r"^[ \t]*[*#_]*[ \t]*PANEL[ \t]*\d+.*$", re.IGNORECASE | re.MULTILINE)
-
-
-def split_panels(script: str, max_panels: int) -> list:
-    """Zerlegt ein Skript in die einzelnen Panel-Abschnitte."""
-    script = (script or "").strip()
-    if not script:
-        return []
-
-    starts = [match.start() for match in _PANEL_HEADING.finditer(script)]
-    if len(starts) >= 2:
-        bounds = starts + [len(script)]
-        blocks = [script[bounds[i]:bounds[i + 1]].strip() for i in range(len(starts))]
-    else:
-        # Kein erkennbarer PANEL-Kopf: notfalls an Leerzeilen trennen
-        blocks = [block.strip() for block in re.split(r"\n[ \t]*\n", script) if block.strip()]
-
-    return blocks[:max_panels]
-
-
-def distribute_to_panels(script: str):
-    """Fuellt die Panel-Textboxen, blendet nicht benoetigte Zeilen aus und
-    entfernt die Bilder der vorherigen Geschichte."""
-    count = CONFIG.max_panels
-    blocks = split_panels(script, count)
-    values = [blocks[i] if i < len(blocks) else "" for i in range(count)]
-    visibility = [gr.update(visible=i < len(blocks)) for i in range(count)]
-    if blocks:
-        note = (
-            f"{len(blocks)} Panels aus dem Skript uebernommen. "
-            "Du kannst die Texte hier aendern und dann Bilder erzeugen."
-        )
-    else:
-        note = "Es gibt noch kein Skript. Schreibe zuerst im Reiter **Figuren** ein Skript."
-    return values + visibility + [note] + [None] * count + [""] * count
-
-
-def clear_panels():
-    return distribute_to_panels("")
-
-
-def generate_panel_image(panel_index: int, panel_text: str):
-    """Schickt eine Panel-Beschreibung an Fooocus und liefert das fertige Bild."""
-    if not (panel_text or "").strip():
-        yield "Diese Textbox ist noch leer.", gr.update()
-        return
-
-    core = fooocus_client.extract_section(panel_text, FOOOCUS.prompt_section)
-    hint = ""
-    if CONFIG.translate_image_prompt:
-        yield f"Panel {panel_index}: Beschreibung wird fuer das Bildmodell uebersetzt ...", gr.update()
-        try:
-            translated = ask_ollama(CONFIG.translation_system_prompt, core)
-            if translated:
-                core = translated
-        except (requests.RequestException, ValueError) as error:
-            hint = (
-                f"\n\n<sub>Hinweis: Die Uebersetzung ins Englische hat nicht geklappt "
-                f"({error}). Es wurde der deutsche Text verwendet.</sub>"
-            )
-
-    prompt = fooocus_client.wrap_prompt(core, FOOOCUS)
-
-    messages: queue.Queue = queue.Queue()
-    result: dict = {}
-
-    def worker():
-        try:
-            result["path"] = fooocus_client.generate_image(prompt, FOOOCUS, on_progress=messages.put)
-        except Exception as error:  # noqa: BLE001 - alles wird als Text angezeigt
-            result["error"] = error
-        finally:
-            messages.put(None)
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-
-    yield f"Panel {panel_index}: Bild wird erzeugt ...", gr.update()
-    while True:
-        message = messages.get()
-        if message is None:
-            break
-        yield f"Panel {panel_index}: {message}", gr.update()
-    thread.join()
-
-    if "error" in result:
-        yield f"Fehler: {result['error']}", gr.update()
-        return
-
-    yield f"Fertig. Bild-Prompt: _{prompt}_{hint}", result["path"]
-
-
-def reset_all():
-    return (
-        "", "", "", "", "", "",           # Figuren
-        "", "", "",                        # Setting, Start, Ziel
-        CONFIG.default_panels,             # Panel-Anzahl
-        "",                                # Skript
-        "Alles zurueckgesetzt. Los geht's!",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Oberflaeche
-# ---------------------------------------------------------------------------
-
-CSS = """
-.big-script textarea {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
-    font-size: 15px !important;
-    line-height: 1.55 !important;
-}
+Du kannst jederzeit zurückgehen und etwas ändern. Viel Spaß!
 """
 
 
-def make_panel_handler(panel_index: int):
-    """Erzeugt den Klick-Handler fuer den 'generiere'-Knopf eines Panels."""
+# ---------------------------------------------------------------- Hilfsteile
 
-    def handler(panel_text):
-        yield from generate_panel_image(panel_index, panel_text)
+def _characters_from_fields(values: List[str]) -> List[Character]:
+    """Aus den 3x3 Textfeldern eine Liste von Figuren bauen."""
+    chars: List[Character] = []
+    for i in range(MAX_CHARACTERS):
+        name, appearance, personality = values[i * 3:i * 3 + 3]
+        chars.append(Character(name or "", appearance or "", personality or ""))
+    return chars
 
-    return handler
+
+def _panels_from_fields(values: List[str], count: int) -> List[Panel]:
+    """Aus den Panel-Karten (je 3 Felder) Panel-Objekte bauen."""
+    panels: List[Panel] = []
+    for i in range(min(count, PANEL_SLOTS)):
+        description, narration, dialogue = values[i * 3:i * 3 + 3]
+        lines = [ln.strip(" -") for ln in (dialogue or "").splitlines() if ln.strip(" -")]
+        panels.append(Panel(index=i + 1,
+                            description=description or "",
+                            narration=narration or "",
+                            dialogue=lines))
+    return panels
+
+
+def _panel_visibility(count: int) -> list:
+    count = int(count)
+    return [gr.update(visible=(i < count)) for i in range(PANEL_SLOTS)]
+
+
+def _panel_field_updates(panels: List[Panel]) -> list:
+    """18 Updates (6 Panels x 3 Felder) für die Panel-Karten."""
+    updates = []
+    for i in range(PANEL_SLOTS):
+        if i < len(panels):
+            panel = panels[i]
+            updates.extend([
+                gr.update(value=panel.description),
+                gr.update(value=panel.narration),
+                gr.update(value=panel.dialogue_text),
+            ])
+        else:
+            updates.extend([gr.update(value=""), gr.update(value=""), gr.update(value="")])
+    return updates
+
+
+def _status(text: str, kind: str = "info") -> str:
+    icons = {"info": "ℹ️", "ok": "✅", "warn": "⚠️", "error": "❌", "work": "⏳"}
+    return "%s %s" % (icons.get(kind, "ℹ️"), text)
+
+
+# ------------------------------------------------------------ Tab 1: Creator
+
+def on_generate_signature(acronym: str, artist_name: str, progress=gr.Progress()):
+    tag = (acronym or "").strip()
+    if not tag:
+        return None, _status("Bitte gib zuerst dein Kürzel ein (2 bis 4 Buchstaben).", "warn"), None
+    if len(tag) > 6:
+        return None, _status("Das Kürzel ist zu lang - nimm 2 bis 4 Buchstaben.", "warn"), None
+
+    progress(0.02, desc="Signatur wird vorbereitet ...")
+
+    def report(fraction: float, message: str) -> None:
+        progress(fraction, desc=message)
+
+    try:
+        path = image_handler.generate_signature(tag, artist_name or "", progress=report)
+    except image_handler.ImageError as err:
+        return None, _status(str(err), "error"), None
+    return path, _status("Fertig! Das ist deine Signatur '%s'." % tag, "ok"), path
+
+
+# --------------------------------------------------------- Tab 2: Characters
+
+def on_load_character_preset(slot: int):
+    name, appearance, personality = CHARACTER_PRESETS[slot]
+    return name, appearance, personality
+
+
+def on_load_all_presets():
+    values = []
+    for preset in CHARACTER_PRESETS:
+        values.extend(preset)
+    return values
+
+
+# -------------------------------------------------------------- Tab 3: Scene
+
+def on_generate_script(
+    panel_count, setting, story_start, story_goal, comic_title, artist_name, *char_values,
+    progress=gr.Progress(),
+):
+    characters = _characters_from_fields(list(char_values))
+    missing = []
+    if not any(c.is_filled for c in characters):
+        missing.append("mindestens eine Figur im Tab 'Characters'")
+    if not (setting or "").strip():
+        missing.append("die Umgebung")
+    if not (story_start or "").strip():
+        missing.append("den Anfang der Geschichte")
+    if not (story_goal or "").strip():
+        missing.append("das Ziel der Geschichte")
+
+    if missing:
+        message = _status("Da fehlt noch etwas: %s." % ", ".join(missing), "warn")
+        return ["", message, *_panel_field_updates([]), *_panel_visibility(panel_count),
+                gr.update(), gr.update(value=message)]
+
+    progress(0.1, desc="Der Geschichten-Computer denkt nach ...")
+    try:
+        result = llm_handler.generate_script(
+            int(panel_count), setting or "", story_start or "", story_goal or "",
+            characters, comic_title or "", artist_name or "",
+        )
+    except llm_handler.LLMError as err:
+        message = _status(str(err), "error")
+        return ["", message, *_panel_field_updates([]),
+                *_panel_visibility(panel_count), gr.update(), gr.update(value=message)]
+
+    panels: List[Panel] = result["panels"]
+    progress(0.95, desc="Drehbuch wird sortiert ...")
+    ok_message = _status(
+        "Dein Drehbuch mit %d Panels ist fertig! Schau im Tab 'Script' nach und "
+        "ändere alles, was dir nicht gefällt." % len(panels), "ok")
+    return [result["raw"], ok_message, *_panel_field_updates(panels),
+            *_panel_visibility(panel_count), gr.update(selected=TAB_SCRIPT),
+            gr.update(value=ok_message)]
+
+
+def on_load_scene_preset():
+    return SCENE_PRESET
+
+
+# ------------------------------------------------------------- Tab 4: Script
+
+def on_reparse_script(script_text, panel_count):
+    """Text aus dem großen Editor wieder in die Panel-Karten übernehmen."""
+    panels = llm_handler.parse_script(script_text or "", expected_panels=int(panel_count))
+    return [*_panel_field_updates(panels), *_panel_visibility(panel_count),
+            _status("Die Panel-Karten wurden aus dem Text neu eingelesen.", "ok")]
+
+
+def on_sync_from_cards(panel_count, *panel_values):
+    """Panel-Karten zurück in den großen Text-Editor schreiben."""
+    panels = _panels_from_fields(list(panel_values), int(panel_count))
+    return (llm_handler.panels_to_markdown(panels),
+            _status("Der Skript-Text wurde aus den Panel-Karten aktualisiert.", "ok"))
+
+
+def on_build_prompt(panel_count, style, comic_title, acronym, *values):
+    """Bild-Prompt aus Panel-Karten und Figuren zusammensetzen."""
+    char_values = list(values[:MAX_CHARACTERS * 3])
+    panel_values = list(values[MAX_CHARACTERS * 3:])
+    characters = _characters_from_fields(char_values)
+    panels = _panels_from_fields(panel_values, int(panel_count))
+
+    if not any(p.description.strip() for p in panels):
+        return ("", _status("Es gibt noch keine Bildbeschreibungen. Erzeuge zuerst im Tab "
+                            "'Scene' ein Drehbuch.", "warn"), gr.update())
+
+    prompt = image_handler.build_page_prompt(
+        panels, characters, style or "", comic_title or "", acronym or "")
+    return (prompt,
+            _status("Der Bild-Prompt ist fertig. Weiter im Tab 'Page'!", "ok"),
+            gr.update(selected=TAB_PAGE))
+
+
+def on_rebuild_prompt(panel_count, style, comic_title, acronym, *values):
+    """Wie on_build_prompt, aber ohne Tab-Wechsel (Button im Tab 'Page')."""
+    prompt, message, _ = on_build_prompt(panel_count, style, comic_title, acronym, *values)
+    return prompt, message
+
+
+# --------------------------------------------------------------- Tab 5: Page
+
+def on_draw_page(prompt, comic_title, acronym, progress=gr.Progress()):
+    if not (prompt or "").strip():
+        return (None, _status("Der Bild-Prompt ist leer. Gehe zurück zum Tab 'Script' und "
+                              "klicke auf 'Weiter zu Page Generation'.", "warn"), None)
+
+    progress(0.02, desc="Verbindung zum Zeichen-Server ...")
+
+    def report(fraction: float, message: str) -> None:
+        progress(fraction, desc=message)
+
+    try:
+        path = image_handler.generate_comic_page(
+            prompt, comic_title or "", acronym or "", progress=report)
+    except image_handler.ImageError as err:
+        return None, _status(str(err), "error"), None
+    return (path,
+            _status("Deine Comic-Seite ist fertig gezeichnet! Weiter zum Tab 'Export'.", "ok"),
+            path)
+
+
+def on_page_to_export(image_path, artist_name, acronym, comic_title, signature_path):
+    """Fertige Seite mit Künstler-Fußleiste in den Export-Tab übernehmen."""
+    if not image_path:
+        return (None, None,
+                _status("Es gibt noch keine gezeichnete Seite.", "warn"),
+                gr.update())
+    try:
+        stamped = export_handler.stamp_signature(
+            image_path, artist_name or "", acronym or "", comic_title or "", signature_path)
+    except export_handler.ExportError as err:
+        return None, None, _status(str(err), "error"), gr.update()
+    return (stamped, stamped,
+            _status("Deine Seite ist bereit zum Speichern und Drucken.", "ok"),
+            gr.update(selected=TAB_EXPORT))
+
+
+# ------------------------------------------------------------- Tab 6: Export
+
+def on_download_png(final_path):
+    if not final_path:
+        return None, _status("Es gibt noch kein Bild zum Speichern.", "warn")
+    try:
+        path = export_handler.export_png(final_path)
+    except export_handler.ExportError as err:
+        return None, _status(str(err), "error")
+    return path, _status("PNG-Datei ist bereit - klicke auf den Datei-Namen zum Speichern.", "ok")
+
+
+def on_download_pdf(final_path, comic_title, artist_name):
+    if not final_path:
+        return None, _status("Es gibt noch kein Bild zum Speichern.", "warn")
+    try:
+        path = export_handler.export_pdf(final_path, comic_title or "", artist_name or "")
+    except export_handler.ExportError as err:
+        return None, _status(str(err), "error")
+    return path, _status("PDF-Datei ist bereit - klicke auf den Datei-Namen zum Speichern.", "ok")
+
+
+def on_print(final_path, artist_name, acronym, comic_title, panel_count):
+    ok, message = export_handler.send_to_print_server(
+        final_path or "", artist_name or "", acronym or "", comic_title or "", int(panel_count or 0))
+    return _status(message, "ok" if ok else "error")
+
+
+# ------------------------------------------------------------- Oberfläche
+
+CSS = """
+.comic-title { text-align: center; }
+.big-button button { font-size: 1.15rem !important; padding: 0.8rem !important; }
+.status-box { min-height: 2.4rem; }
+.hint { font-size: 0.95rem; opacity: 0.85; }
+"""
 
 
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title=CONFIG.app_title, theme=gr.themes.Soft(), css=CSS) as demo:
-        gr.Markdown(f"# {CONFIG.app_title}\n{CONFIG.app_subtitle}")
+    with gr.Blocks(title="Comic Maker", theme=gr.themes.Soft(), css=CSS) as demo:
+        # --- Zustand
+        st_signature = gr.State(None)
+        st_page_image = gr.State(None)
+        st_final_image = gr.State(None)
 
-        with gr.Tabs():
-            # -----------------------------------------------------------------
-            # Reiter 1: Figuren und Skript
-            # -----------------------------------------------------------------
-            with gr.Tab("Figuren"):
+        gr.Markdown("# 🎨 Comic Maker - deine eigene Comic-Seite",
+                    elem_classes=["comic-title"])
+
+        with gr.Tabs() as tabs:
+            # ============================================== TAB 1: CREATOR
+            with gr.Tab("1. Creator", id=TAB_CREATOR):
+                gr.Markdown(WELCOME)
                 with gr.Row():
-                    with gr.Column(scale=1):
-                        gr.Markdown("## 1. Deine Figuren\nDu kannst bis zu drei Figuren erfinden.")
+                    with gr.Column(scale=3):
+                        artist_name = gr.Textbox(
+                            label="Künstlername", placeholder="z. B. Lina M. oder StarPainter",
+                            info="So heißt du als Comic-Zeichnerin.")
+                        acronym = gr.Textbox(
+                            label="Kürzel (2–4 Buchstaben)", placeholder="z. B. LNA",
+                            max_lines=1, info="Kommt als Signatur in die Ecke der Seite.")
+                        comic_title = gr.Textbox(
+                            label="Comic-Titel (optional)",
+                            placeholder="z. B. Das Rätsel im Labor")
+                        btn_signature = gr.Button("✒️ Signature generieren", variant="primary",
+                                                  elem_classes=["big-button"])
+                        creator_status = gr.Markdown(_status(
+                            "Trage deinen Namen ein und erzeuge dein Signatur-Logo.", "info"),
+                            elem_classes=["status-box"])
+                    with gr.Column(scale=2):
+                        signature_image = gr.Image(
+                            label="Dein Signatur-Logo", type="filepath",
+                            height=320, interactive=False, show_download_button=True)
 
-                        character_inputs = []
-                        for index in range(1, MAX_CHARACTERS + 1):
-                            with gr.Accordion(f"Figur {index}", open=(index == 1)):
-                                name = gr.Textbox(
-                                    label="Name",
-                                    placeholder="z.B. Lina",
-                                    max_lines=1,
-                                )
-                                description = gr.Textbox(
-                                    label="Beschreibung",
-                                    placeholder="Wie sieht die Figur aus? Wie alt ist sie? "
-                                    "Was kann sie besonders gut? Was mag sie?",
-                                    lines=4,
-                                )
-                                character_inputs.extend([name, description])
-
-                        gr.Markdown("## 2. Die Szene")
-                        setting = gr.Textbox(
-                            label="Setting - wo und wann spielt die Szene?",
-                            placeholder="z.B. In einer Werkstatt voller Roboter, spaet am Abend. "
-                            "Draussen regnet es.",
-                            lines=3,
-                        )
-                        start_scene = gr.Textbox(
-                            label="Startszene - wie faengt es an?",
-                            placeholder="z.B. Lina findet einen kaputten Roboter unter einer Decke.",
-                            lines=3,
-                        )
-                        goal = gr.Textbox(
-                            label="Ziel - wie soll es ausgehen?",
-                            placeholder="z.B. Der Roboter laeuft wieder und bedankt sich bei Lina.",
-                            lines=3,
-                        )
-
-                        panel_count = gr.Slider(
-                            minimum=CONFIG.min_panels,
-                            maximum=CONFIG.max_panels,
-                            value=CONFIG.default_panels,
-                            step=1,
-                            label="Wie viele Panels soll die Seite haben?",
-                        )
-
-                        with gr.Row():
-                            generate_button = gr.Button("Skript schreiben", variant="primary", scale=3)
-                            reset_button = gr.Button("Zuruecksetzen", scale=1)
-
-                    with gr.Column(scale=1):
-                        gr.Markdown("## 3. Dein Comic-Skript")
-                        status = gr.Markdown(check_ollama())
-                        script = gr.Textbox(
-                            label="Skript (du kannst hier alles aendern)",
-                            lines=32,
-                            max_lines=60,
-                            show_copy_button=True,
-                            elem_classes="big-script",
-                            placeholder="Hier erscheint dein Skript, sobald du auf "
-                            "'Skript schreiben' klickst.",
-                        )
-
-                inputs = character_inputs + [setting, start_scene, goal, panel_count]
-
-                gr.Examples(
-                    examples=[
-                        [
-                            "Lina", "12 Jahre alt, kurze rote Locken, Latzhose voller Werkzeug, "
-                            "bastelt am liebsten an Maschinen.",
-                            "Bolt", "Ein kleiner runder Roboter mit einem verbeulten Arm und "
-                            "einem leuchtenden blauen Auge. Er piepst statt zu sprechen.",
-                            "", "",
-                            "Eine alte Fahrradwerkstatt, die Lina zur Roboter-Werkstatt umgebaut hat. "
-                            "Abends, warmes Lampenlicht, ueberall Schrauben und Kabel.",
-                            "Lina zieht eine staubige Decke von einem alten Roboter und entdeckt, "
-                            "dass er noch ganz leise summt.",
-                            "Lina repariert Bolts Arm und die beiden werden Freunde.",
-                            5,
-                        ],
-                    ],
-                    inputs=inputs,
-                    label="Beispiel zum Ausprobieren",
-                )
-
-            # -----------------------------------------------------------------
-            # Reiter 2: Panels und Bilder
-            # -----------------------------------------------------------------
-            with gr.Tab("Panels"):
+            # =========================================== TAB 2: CHARACTERS
+            with gr.Tab("2. Characters", id=TAB_CHARACTERS):
                 gr.Markdown(
-                    "## Deine Panels\n"
-                    "Hier steht jedes Panel deines Skripts in einer eigenen Textbox. "
-                    "Aendere den Text, wenn du moechtest, und klicke dann auf **generiere**, "
-                    "um ein Bild dazu zeichnen zu lassen."
-                )
+                    "## Wer kommt in deinem Comic vor?\n"
+                    "Beschreibe **1 bis 3 Figuren**. Je genauer du das Aussehen beschreibst, "
+                    "desto besser sehen die Figuren auf jedem Panel gleich aus.")
+                btn_all_presets = gr.Button("🎁 Alle Beispiel-Figuren laden")
+
+                char_fields: List[gr.Textbox] = []
+                preset_buttons = []
+                for slot in range(MAX_CHARACTERS):
+                    open_default = slot == 0
+                    with gr.Accordion("Figur %d%s" % (slot + 1,
+                                      "" if open_default else " (optional)"),
+                                      open=open_default):
+                        c_name = gr.Textbox(label="Name der Figur",
+                                            placeholder="z. B. Lina, Robot-X")
+                        c_look = gr.Textbox(
+                            label="Aussehen & Kleidung", lines=3,
+                            placeholder="Haarfarbe, Kleidung, MINT-Ausrüstung "
+                                        "(Laborkittel, Schutzbrille, Lupe ...)")
+                        c_traits = gr.Textbox(
+                            label="Eigenschaften",
+                            placeholder="z. B. neugierige Forscherin, hilfsbereiter Roboter")
+                        btn_preset = gr.Button("Beispiel laden", size="sm")
+                        btn_preset.click(
+                            fn=(lambda s=slot: on_load_character_preset(s)),
+                            outputs=[c_name, c_look, c_traits])
+                        preset_buttons.append(btn_preset)
+                        char_fields.extend([c_name, c_look, c_traits])
+
+                btn_all_presets.click(fn=on_load_all_presets, outputs=char_fields)
+
+            # ================================================ TAB 3: SCENE
+            with gr.Tab("3. Scene", id=TAB_SCENE):
+                gr.Markdown(
+                    "## Wo spielt deine Geschichte?\n"
+                    "Benutze die **Namen deiner Figuren** aus Schritt 2, damit sie in der "
+                    "Geschichte richtig vorkommen.")
+                setting = gr.Textbox(
+                    label="Umgebung / Ort", lines=3,
+                    placeholder="z. B. Ein modernes Schul-Labor mit bunten Flüssigkeiten "
+                                "und Computern")
+                story_start = gr.Textbox(
+                    label="Anfang der Geschichte", lines=3,
+                    placeholder="z. B. Lina entdeckt eine seltsame leuchtende Formel an der Tafel")
+                story_goal = gr.Textbox(
+                    label="Ziel / Ende der Geschichte", lines=3,
+                    placeholder="z. B. Sie lösen gemeinsam das Rätsel und starten das "
+                                "Experiment erfolgreich")
+                panel_count = gr.Slider(
+                    label="Anzahl der Panels", minimum=config.MIN_PANELS,
+                    maximum=config.MAX_PANELS, step=1, value=config.MIN_PANELS)
                 with gr.Row():
-                    take_over_button = gr.Button("Skript in die Panels uebernehmen", scale=2)
-                    fooocus_status = gr.Markdown(fooocus_client.check_server(FOOOCUS))
+                    btn_scene_preset = gr.Button("🎁 Beispiel-Szene laden")
+                    btn_script = gr.Button("📝 Script generieren", variant="primary",
+                                           elem_classes=["big-button"])
+                scene_status = gr.Markdown(_status(
+                    "Fülle die drei Felder aus und klicke auf 'Script generieren'. "
+                    "Das dauert einen Moment.", "info"), elem_classes=["status-box"])
+                gr.Markdown(
+                    "<span class='hint'>Der Text wird von einem Sprachmodell (%s) "
+                    "auf deinem eigenen Rechner geschrieben.</span>" % config.OLLAMA_MODEL)
 
-                panel_note = gr.Markdown(
-                    "Es gibt noch kein Skript. Schreibe zuerst im Reiter **Figuren** ein Skript."
-                )
+                btn_scene_preset.click(fn=on_load_scene_preset,
+                                       outputs=[setting, story_start, story_goal])
 
-                panel_rows, panel_boxes, panel_images, panel_notes = [], [], [], []
-                for index in range(1, CONFIG.max_panels + 1):
-                    with gr.Row(visible=False, equal_height=True) as row:
-                        with gr.Column(scale=3):
-                            box = gr.Textbox(
-                                label=f"Panel {index}",
-                                lines=12,
-                                max_lines=24,
-                                elem_classes="big-script",
-                            )
-                            panel_button = gr.Button(
-                                f"generiere Bild fuer Panel {index}", variant="primary"
-                            )
-                            panel_message = gr.Markdown("")
-                        with gr.Column(scale=2):
-                            image = gr.Image(
-                                label=f"Bild zu Panel {index}",
-                                type="filepath",
-                                height=420,
-                                show_download_button=True,
-                                interactive=False,
-                            )
-                    panel_rows.append(row)
-                    panel_boxes.append(box)
-                    panel_images.append(image)
-                    panel_notes.append(panel_message)
+            # =============================================== TAB 4: SCRIPT
+            with gr.Tab("4. Script", id=TAB_SCRIPT):
+                gr.Markdown(
+                    "## Dein Drehbuch\n"
+                    "Hier steht, was auf jedem Panel passiert. **Du darfst alles ändern!**")
+                gr.Markdown(
+                    "> **Wichtig:** Halte die Texte kurz und einfach. "
+                    "Erzähler-Text: höchstens ca. 15 Wörter. "
+                    "Sprechblasen: höchstens ca. 12 Wörter - sonst passt der Text "
+                    "nicht in die Blase.")
+                master_script = gr.Textbox(
+                    label="Gesamtes Skript", lines=18, show_copy_button=True,
+                    placeholder="Hier erscheint das Drehbuch, nachdem du im Tab 'Scene' "
+                                "auf 'Script generieren' geklickt hast.")
+                with gr.Row():
+                    btn_reparse = gr.Button("⬇️ Text in die Panel-Karten übernehmen")
+                    btn_sync = gr.Button("⬆️ Panel-Karten in den Text übernehmen")
 
-                    panel_button.click(
-                        fn=make_panel_handler(index),
-                        inputs=[box],
-                        outputs=[panel_message, image],
-                    )
+                panel_groups = []
+                panel_fields: List[gr.Textbox] = []
+                for slot in range(PANEL_SLOTS):
+                    with gr.Group(visible=slot < config.MIN_PANELS) as group:
+                        gr.Markdown("### Panel %d" % (slot + 1))
+                        p_desc = gr.Textbox(
+                            label="Bildbeschreibung", lines=3,
+                            placeholder="Was sieht man im Bild? z. B. Lina blickt überrascht "
+                                        "auf das Mikroskop")
+                        p_narr = gr.Textbox(
+                            label="Erzähler-Text (max. ~15 Wörter)", lines=2,
+                            placeholder="Kurzer Text im Kästchen oben im Panel")
+                        p_dial = gr.Textbox(
+                            label="Sprechblasen (eine Zeile pro Blase)", lines=3,
+                            placeholder='Lina: "Das gibt\'s doch gar nicht!"')
+                    panel_groups.append(group)
+                    panel_fields.extend([p_desc, p_narr, p_dial])
 
-        # ---------------------------------------------------------------------
-        # Verdrahtung
-        # ---------------------------------------------------------------------
-        panel_outputs = panel_boxes + panel_rows + [panel_note] + panel_images + panel_notes
+                script_status = gr.Markdown("", elem_classes=["status-box"])
+                btn_to_page = gr.Button("➡️ Weiter zu Page Generation", variant="primary",
+                                        elem_classes=["big-button"])
 
-        generate_button.click(
-            fn=generate_script,
-            inputs=inputs,
-            outputs=[script, status],
-        ).then(
-            fn=distribute_to_panels,
-            inputs=[script],
-            outputs=panel_outputs,
+            # ================================================= TAB 5: PAGE
+            with gr.Tab("5. Page", id=TAB_PAGE):
+                gr.Markdown("## Deine Comic-Seite zeichnen")
+                style = gr.Textbox(
+                    label="Style (wie soll die Seite aussehen?)", lines=3, value=STYLE_PRESET,
+                    info="Beschreibe den Zeichenstil - Farben, Linien, Stimmung.")
+                page_prompt = gr.Textbox(
+                    label="Bild-Prompt (wird an den Zeichen-Server geschickt)", lines=12,
+                    show_copy_button=True,
+                    placeholder="Klicke im Tab 'Script' auf 'Weiter zu Page Generation'.")
+                with gr.Row():
+                    btn_rebuild_prompt = gr.Button("🔄 Prompt neu zusammenbauen")
+                    btn_draw = gr.Button("🖍️ Comic-Seite zeichnen", variant="primary",
+                                         elem_classes=["big-button"])
+                    btn_redraw = gr.Button("🎲 Nochmal zeichnen (neuer Versuch)")
+                page_status = gr.Markdown(_status(
+                    "Wenn der Prompt gut aussieht, klicke auf 'Comic-Seite zeichnen'. "
+                    "Das kann ein bis zwei Minuten dauern.", "info"),
+                    elem_classes=["status-box"])
+                page_image = gr.Image(
+                    label="Deine Comic-Seite", type="filepath", height=760,
+                    interactive=False, show_download_button=True)
+                btn_to_export = gr.Button("➡️ Weiter zum Export", variant="primary",
+                                          elem_classes=["big-button"])
+
+            # =============================================== TAB 6: EXPORT
+            with gr.Tab("6. Export", id=TAB_EXPORT):
+                gr.Markdown(
+                    "## Speichern und drucken\n"
+                    "Unten siehst du deine fertige Seite mit deiner Signatur-Zeile.")
+                final_image = gr.Image(
+                    label="Fertige Comic-Seite", type="filepath", height=760,
+                    interactive=False, show_download_button=True)
+                with gr.Row():
+                    btn_png = gr.Button("💾 Als PNG speichern")
+                    btn_pdf = gr.Button("📄 Als PDF speichern")
+                    btn_print = gr.Button("🖨️ Drucken / Absenden", variant="primary",
+                                          elem_classes=["big-button"])
+                download_file = gr.File(label="Deine Datei", interactive=False)
+                export_status = gr.Markdown(_status(
+                    "Erzeuge zuerst im Tab 'Page' eine Comic-Seite.", "info"),
+                    elem_classes=["status-box"])
+                gr.Markdown("<span class='hint'>Druckserver: %s</span>"
+                            % config.print_server_url())
+
+        # ------------------------------------------------------- Verdrahtung
+
+        btn_signature.click(
+            fn=on_generate_signature,
+            inputs=[acronym, artist_name],
+            outputs=[signature_image, creator_status, st_signature],
         )
 
-        reset_button.click(
-            fn=reset_all,
-            inputs=None,
-            outputs=inputs + [script, status],
-        ).then(
-            fn=clear_panels,
-            inputs=None,
-            outputs=panel_outputs,
+        panel_count.change(fn=_panel_visibility, inputs=[panel_count], outputs=panel_groups)
+
+        btn_script.click(
+            fn=on_generate_script,
+            inputs=[panel_count, setting, story_start, story_goal, comic_title, artist_name,
+                    *char_fields],
+            outputs=[master_script, scene_status, *panel_fields, *panel_groups, tabs,
+                     script_status],
         )
 
-        take_over_button.click(
-            fn=distribute_to_panels,
-            inputs=[script],
-            outputs=panel_outputs,
+        btn_reparse.click(
+            fn=on_reparse_script,
+            inputs=[master_script, panel_count],
+            outputs=[*panel_fields, *panel_groups, script_status],
         )
 
-        gr.Markdown(
-            f"<sub>Text: `{CONFIG.model}` auf {CONFIG.ollama_url} &middot; "
-            f"Bilder: Fooocus auf {FOOOCUS.url} &middot; "
-            "Einstellungen und Verhalten werden in der Datei `.env` festgelegt.</sub>"
+        btn_sync.click(
+            fn=on_sync_from_cards,
+            inputs=[panel_count, *panel_fields],
+            outputs=[master_script, script_status],
         )
+
+        btn_to_page.click(
+            fn=on_build_prompt,
+            inputs=[panel_count, style, comic_title, acronym, *char_fields, *panel_fields],
+            outputs=[page_prompt, script_status, tabs],
+        )
+
+        btn_rebuild_prompt.click(
+            fn=on_rebuild_prompt,
+            inputs=[panel_count, style, comic_title, acronym, *char_fields, *panel_fields],
+            outputs=[page_prompt, page_status],
+        )
+
+        for button in (btn_draw, btn_redraw):
+            button.click(
+                fn=on_draw_page,
+                inputs=[page_prompt, comic_title, acronym],
+                outputs=[page_image, page_status, st_page_image],
+            )
+
+        btn_to_export.click(
+            fn=on_page_to_export,
+            inputs=[st_page_image, artist_name, acronym, comic_title, st_signature],
+            outputs=[final_image, st_final_image, export_status, tabs],
+        )
+
+        btn_png.click(fn=on_download_png, inputs=[st_final_image],
+                      outputs=[download_file, export_status])
+        btn_pdf.click(fn=on_download_pdf, inputs=[st_final_image, comic_title, artist_name],
+                      outputs=[download_file, export_status])
+        btn_print.click(fn=on_print,
+                        inputs=[st_final_image, artist_name, acronym, comic_title, panel_count],
+                        outputs=[export_status])
 
     return demo
 
 
-if __name__ == "__main__":
-    build_ui().queue().launch(
-        server_name=CONFIG.server_name,
-        server_port=CONFIG.server_port,
-        share=CONFIG.share,
-        inbrowser=True,
+def main() -> None:
+    demo = build_ui()
+    demo.queue().launch(
+        server_name=config.GRADIO_SERVER_NAME,
+        server_port=config.GRADIO_SERVER_PORT,
+        share=config.GRADIO_SHARE,
+        show_error=True,
+        allowed_paths=[str(config.OUTPUT_DIR)],
     )
+
+
+if __name__ == "__main__":
+    main()
