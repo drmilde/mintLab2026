@@ -1,0 +1,805 @@
+<meta charset="utf-8">
+<title>Comics generieren mit KI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bangers&family=Baloo+2:wght@600;800&family=Nunito:wght@400;600;800&display=swap">
+
+<style>
+  /* ---------------------------------------------- Farben & Grundwerte
+     Eine bewusst einzige Bildwelt: Comic-Druck auf hellem Papier.
+     Alle Farben sind explizit gesetzt, damit die Seite auf jedem
+     Hintergrund gleich aussieht. */
+  :root {
+    --ink: #17141F;
+    --paper: #FFFCF3;
+    --sheet: #FFFFFF;
+    --grey: #6F6A7A;
+    --cyan: #0E9FD4;
+    --magenta: #E6376F;
+    --yellow: #FFC93C;
+    --mint: #2FBF8F;
+    --dot: rgba(23, 20, 31, .13);
+    --hard: 6px 6px 0 var(--ink);
+    --hard-sm: 4px 4px 0 var(--ink);
+    --f-display: "Bangers", "Baloo 2", system-ui, sans-serif;
+    --f-head: "Baloo 2", "Trebuchet MS", system-ui, sans-serif;
+    --f-body: "Nunito", "Segoe UI", system-ui, sans-serif;
+    --f-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background-color: var(--paper);
+    background-image: radial-gradient(var(--dot) 1.6px, transparent 1.7px);
+    background-size: 14px 14px;
+    color: var(--ink);
+    font-family: var(--f-body);
+    font-size: clamp(1rem, .55rem + .55vw, 1.2rem);
+    line-height: 1.5;
+  }
+
+  .stage {
+    max-width: 1120px;
+    margin: 0 auto;
+    padding-inline: 16px;
+    padding-block: clamp(14px, 3vw, 30px) 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    min-height: 100dvh;
+  }
+
+  /* ------------------------------------------------------- Kopfleiste */
+  .brandbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px 16px;
+    font-family: var(--f-display);
+    letter-spacing: .06em;
+    font-size: clamp(.85rem, .7rem + .4vw, 1.05rem);
+    color: var(--grey);
+  }
+  .brandbar b { color: var(--ink); font-weight: 400; }
+
+  /* ------------------------------------------------------ Folien-Body */
+  .deck { flex: 1; }
+
+  .slide {
+    display: flex;
+    flex-direction: column;
+    gap: clamp(14px, 2vw, 20px);
+    animation: pop .18s ease-out;
+  }
+  .slide[hidden] { display: none !important; }
+
+  @keyframes pop { from { transform: translateY(6px); opacity: .4; } }
+  @media (prefers-reduced-motion: reduce) { .slide { animation: none; } }
+
+  .slide:focus-visible { outline: 3px dashed var(--cyan); outline-offset: 10px; }
+
+  /* Erzähler-Kasten: so beginnt im Comic jedes Panel */
+  .caption {
+    align-self: flex-start;
+    background: var(--yellow);
+    border: 3px solid var(--ink);
+    box-shadow: var(--hard-sm);
+    padding: 8px 16px 6px;
+    transform: rotate(-1deg);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    max-width: 100%;
+  }
+  .caption .kicker {
+    font-family: var(--f-display);
+    letter-spacing: .08em;
+    font-size: 1rem;
+    color: var(--ink);
+    background: var(--sheet);
+    border: 2px solid var(--ink);
+    padding: 1px 8px;
+  }
+  .caption h2 {
+    font-family: var(--f-head);
+    font-weight: 800;
+    font-size: clamp(1.4rem, 1rem + 1.9vw, 2.3rem);
+    line-height: 1.1;
+    margin: 0;
+    text-wrap: balance;
+  }
+
+  /* Panels = die Kästen einer Comicseite */
+  .grid { display: grid; gap: clamp(14px, 2vw, 20px); }
+  .grid.two { grid-template-columns: 1fr 1fr; }
+  .grid.three { grid-template-columns: repeat(3, 1fr); }
+  @media (max-width: 760px) {
+    .grid.two, .grid.three { grid-template-columns: 1fr; }
+  }
+
+  .panel {
+    background: var(--sheet);
+    border: 3px solid var(--ink);
+    box-shadow: var(--hard);
+    padding: clamp(14px, 2vw, 22px);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: 0;
+  }
+  .panel h3 {
+    font-family: var(--f-head);
+    font-weight: 800;
+    font-size: clamp(1.05rem, .9rem + .5vw, 1.35rem);
+    margin: 0;
+    line-height: 1.2;
+  }
+  .panel p { margin: 0; }
+  .panel.cyan { border-top: 12px solid var(--cyan); }
+  .panel.magenta { border-top: 12px solid var(--magenta); }
+  .panel.mint { border-top: 12px solid var(--mint); }
+
+  ul.plain { margin: 0; padding-left: 1.1em; display: grid; gap: 7px; }
+  ul.plain li::marker { color: var(--magenta); }
+
+  /* Nummerierte Schritte */
+  ol.steps { list-style: none; counter-reset: s; margin: 0; padding: 0; display: grid; gap: 11px; }
+  /* Der Schritt-Text bleibt ein durchgehender Fluss - fett gesetzte Begriffe
+     duerfen den Punkt nicht in mehrere Kaesten zerlegen. */
+  ol.steps li {
+    counter-increment: s;
+    position: relative;
+    padding-left: 46px;
+    min-height: 34px;
+  }
+  ol.steps li::before {
+    content: counter(s);
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 34px;
+    height: 34px;
+    font-family: var(--f-display);
+    font-size: 1.25rem;
+    line-height: 30px;
+    text-align: center;
+    background: var(--cyan);
+    color: var(--sheet);
+    border: 2px solid var(--ink);
+  }
+
+  /* Sprechblase für Tipps */
+  .bubble {
+    position: relative;
+    background: var(--sheet);
+    border: 3px solid var(--ink);
+    border-radius: 22px;
+    padding: 14px 18px;
+    box-shadow: var(--hard-sm);
+    font-weight: 700;
+  }
+  .bubble::before, .bubble::after {
+    content: "";
+    position: absolute;
+    bottom: -18px;
+    left: 32px;
+    border: 9px solid transparent;
+    border-top-color: var(--ink);
+  }
+  .bubble::after {
+    bottom: -13px;
+    border-top-color: var(--sheet);
+  }
+
+  /* Getippter Prompt */
+  .prompt {
+    font-family: var(--f-mono);
+    font-size: .9em;
+    background: #EAF7FD;
+    border: 2px dashed var(--ink);
+    padding: 12px 14px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .tag {
+    font-family: var(--f-display);
+    letter-spacing: .08em;
+    font-size: .85rem;
+    color: var(--grey);
+  }
+
+  /* Fußstreifen einer Aufgabenfolie */
+  .strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 26px;
+    border: 3px solid var(--ink);
+    background: var(--sheet);
+    box-shadow: var(--hard-sm);
+    padding: 12px 16px;
+  }
+  .strip > div { display: flex; gap: 10px; align-items: baseline; min-width: 0; }
+  .strip b { font-family: var(--f-display); letter-spacing: .07em; font-weight: 400; color: var(--magenta); white-space: nowrap; }
+
+  /* ------------------------------------------------------- Titelfolie */
+  .title-card {
+    background: var(--sheet);
+    border: 4px solid var(--ink);
+    box-shadow: 10px 10px 0 var(--ink);
+    padding: clamp(20px, 4vw, 44px);
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .event {
+    font-family: var(--f-display);
+    letter-spacing: .1em;
+    font-size: clamp(1rem, .8rem + .8vw, 1.5rem);
+    color: var(--cyan);
+  }
+  .title-card h1 {
+    font-family: var(--f-display);
+    font-weight: 400;
+    letter-spacing: .02em;
+    font-size: clamp(2.4rem, 1.2rem + 7.5vw, 5.6rem);
+    line-height: .95;
+    margin: 0;
+    color: var(--ink);
+    text-shadow: 5px 5px 0 var(--yellow), 9px 9px 0 var(--magenta);
+    text-wrap: balance;
+  }
+  .presenters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 14px;
+  }
+  .presenters span {
+    font-family: var(--f-head);
+    font-weight: 800;
+    font-size: clamp(1rem, .85rem + .5vw, 1.25rem);
+    border: 3px solid var(--ink);
+    background: var(--yellow);
+    box-shadow: var(--hard-sm);
+    padding: 6px 14px;
+  }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chips li {
+    list-style: none;
+    border: 2px solid var(--ink);
+    background: var(--paper);
+    padding: 4px 11px;
+    font-weight: 700;
+    font-size: .92em;
+  }
+
+  /* --------------------------------------------------------- Diagramme */
+  figure { margin: 0; display: grid; gap: 8px; }
+  figure svg { width: 100%; height: auto; display: block; border: 2px solid var(--ink); background: var(--sheet); }
+  figcaption { font-size: .88em; color: var(--grey); }
+
+  /* Ablauf der 6 Tabs */
+  .tabs { display: grid; gap: 12px; }
+  .tabstep {
+    display: grid;
+    grid-template-columns: 52px 1fr;
+    gap: 14px;
+    align-items: center;
+    border: 3px solid var(--ink);
+    background: var(--sheet);
+    box-shadow: var(--hard-sm);
+    padding: 10px 14px;
+    min-width: 0;
+  }
+  .tabstep .no {
+    font-family: var(--f-display);
+    font-size: 1.6rem;
+    text-align: center;
+    line-height: 44px;
+    height: 46px;
+    border: 2px solid var(--ink);
+    background: var(--cyan);
+    color: var(--sheet);
+  }
+  .tabstep:nth-child(even) .no { background: var(--magenta); }
+  .tabstep h4 { margin: 0; font-family: var(--f-head); font-size: 1.05rem; font-weight: 800; }
+  .tabstep p { margin: 0; font-size: .95em; }
+
+  /* ------------------------------------------------------- Steuerung */
+  .controls {
+    position: sticky;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--ink);
+    border: 3px solid var(--ink);
+    padding: 8px 10px;
+    box-shadow: var(--hard-sm);
+  }
+  .controls button {
+    font-family: var(--f-display);
+    letter-spacing: .06em;
+    font-size: 1rem;
+    background: var(--yellow);
+    color: var(--ink);
+    border: 2px solid var(--ink);
+    box-shadow: 3px 3px 0 var(--sheet);
+    padding: 6px 16px;
+    cursor: pointer;
+  }
+  .controls button:hover { background: var(--sheet); }
+  .controls button:disabled { opacity: .4; cursor: default; box-shadow: none; }
+  .controls button:focus-visible { outline: 3px solid var(--cyan); outline-offset: 2px; }
+  .dots { display: flex; gap: 6px; flex: 1; flex-wrap: wrap; justify-content: center; }
+  .dots button {
+    width: 16px; height: 16px; padding: 0;
+    background: var(--sheet); box-shadow: none; border-radius: 50%;
+  }
+  .dots button[aria-current="true"] { background: var(--magenta); }
+  .counter {
+    font-family: var(--f-display);
+    letter-spacing: .08em;
+    color: var(--paper);
+    font-size: 1rem;
+    white-space: nowrap;
+  }
+  @media (max-width: 560px) {
+    .dots { display: none; }
+  }
+
+  /* ---------------------------------------------------------- Drucken */
+  @media print {
+    body { background: #FFFFFF; }
+    .controls, .brandbar { display: none; }
+    .slide[hidden] { display: flex !important; }
+    .slide { page-break-after: always; animation: none; }
+    .panel, .title-card, .strip, .tabstep { box-shadow: none; }
+  }
+</style>
+
+<div class="stage">
+  <div class="brandbar">
+    <span><b>MINT-Labortage 2026</b> · Hochschule Fulda</span>
+    <span>Comics generieren mit KI</span>
+  </div>
+
+  <main class="deck" id="deck">
+
+    <!-- ============================================ 1 · Titel -->
+    <section class="slide" id="folie-1" tabindex="-1" aria-label="Folie 1: Titel">
+      <div class="title-card">
+        <p class="event">MINT-Labortage 2026 · Hochschule Fulda</p>
+        <h1>Comics generieren mit KI</h1>
+        <p style="margin:0; font-size:1.15em; max-width:60ch;">
+          Heute wirst du Comic-Zeichnerin und Comic-Autor. Die Idee kommt von dir –
+          die KI malt und schreibt mit.
+        </p>
+        <div class="presenters">
+          <span>Elisabeth Milde</span>
+          <span>Jan-Torsten Milde</span>
+        </div>
+        <ul class="chips">
+          <li>Prompts schreiben</li>
+          <li>Bilder erzeugen</li>
+          <li>Comics lesen lernen</li>
+          <li>Eigene Seite bauen</li>
+          <li>Drucken</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- ============================================ 2 · Technik -->
+    <section class="slide" id="folie-2" hidden tabindex="-1" aria-label="Folie 2: Wie die KI arbeitet">
+      <div class="caption">
+        <span class="kicker">GRUNDLAGEN</span>
+        <h2>Wie denkt so eine KI eigentlich?</h2>
+      </div>
+
+      <div class="grid two">
+        <article class="panel cyan">
+          <p class="tag">SPRACH-KI · LLM</p>
+          <h3>Die Maschine, die das nächste Wort rät</h3>
+          <ul class="plain">
+            <li>Sie hat riesige Mengen Text gelesen – Bücher, Webseiten, Lexikon-Artikel.</li>
+            <li>Dabei hat sie gemerkt, welche Wörter oft zusammen vorkommen.</li>
+            <li>Jetzt rät sie immer nur <strong>das nächste Wort</strong> – wie die Vorschläge auf deinem Handy, nur viel besser.</li>
+            <li>Wort für Wort entsteht so ein ganzer Text. Bei uns: dein Comic-Drehbuch.</li>
+          </ul>
+          <figure>
+            <svg viewBox="0 0 400 150" role="img" aria-label="Die KI schätzt, welches Wort als nächstes kommt: Roboter 62 Prozent, Hund 21 Prozent, Stern 9 Prozent.">
+              <text x="14" y="28" font-family="Nunito, sans-serif" font-size="16" font-weight="700" fill="#17141F">„Im Labor stand ein kleiner …“</text>
+              <rect x="14" y="44" width="216" height="22" fill="#0E9FD4"></rect>
+              <text x="222" y="60" font-family="Nunito, sans-serif" font-size="14" font-weight="700" fill="#17141F" text-anchor="end" style="fill:#FFFFFF">Roboter</text>
+              <text x="240" y="60" font-family="Nunito, sans-serif" font-size="14" fill="#17141F">62 %</text>
+              <rect x="14" y="76" width="73" height="22" fill="#E6376F"></rect>
+              <text x="79" y="92" font-family="Nunito, sans-serif" font-size="14" font-weight="700" text-anchor="end" style="fill:#FFFFFF">Hund</text>
+              <text x="97" y="92" font-family="Nunito, sans-serif" font-size="14" fill="#17141F">21 %</text>
+              <rect x="14" y="108" width="31" height="22" fill="#FFC93C"></rect>
+              <text x="55" y="124" font-family="Nunito, sans-serif" font-size="14" fill="#17141F">Stern · 9 %</text>
+            </svg>
+            <figcaption>Die KI versteht nicht wie du. Sie rechnet aus, was am besten passt.</figcaption>
+          </figure>
+        </article>
+
+        <article class="panel magenta">
+          <p class="tag">BILD-KI · DIFFUSION</p>
+          <h3>Aus Rauschen wird ein Bild</h3>
+          <ul class="plain">
+            <li>Am Anfang ist nur <strong>Rauschen</strong> – wie das Flimmern im alten Fernseher.</li>
+            <li>Die KI hat beim Üben gelernt, Rauschen wieder wegzunehmen.</li>
+            <li>Schritt für Schritt wird das Bild klarer. Dein Text sagt ihr, was am Ende zu sehen sein soll.</li>
+            <li>Nach ungefähr 8 bis 30 Schritten ist das Bild fertig.</li>
+          </ul>
+          <figure>
+            <svg viewBox="0 0 400 130" role="img" aria-label="Vier Stufen: Aus reinem Rauschen wird Schritt für Schritt ein Roboter-Gesicht.">
+              <defs>
+                <filter id="grain" x="0" y="0" width="100%" height="100%">
+                  <feTurbulence type="fractalNoise" baseFrequency="0.85" numOctaves="3"></feTurbulence>
+                  <feColorMatrix type="matrix" values="0.33 0.33 0.33 0 0  0.33 0.33 0.33 0 0  0.33 0.33 0.33 0 0  0 0 0 0 1"></feColorMatrix>
+                </filter>
+                <g id="face">
+                  <circle cx="45" cy="48" r="30" fill="#0E9FD4"></circle>
+                  <circle cx="35" cy="44" r="6" fill="#FFFFFF"></circle>
+                  <circle cx="56" cy="44" r="6" fill="#FFFFFF"></circle>
+                  <rect x="33" y="60" width="24" height="5" fill="#17141F"></rect>
+                  <rect x="43" y="10" width="4" height="10" fill="#17141F"></rect>
+                  <circle cx="45" cy="9" r="5" fill="#E6376F"></circle>
+                </g>
+              </defs>
+              <g>
+                <rect x="6" y="8" width="88" height="88" fill="#FFFCF3"></rect>
+                <use href="#face" x="0" y="0"></use>
+                <rect x="6" y="8" width="88" height="88" filter="url(#grain)" opacity="1"></rect>
+                <rect x="6" y="8" width="88" height="88" fill="none" stroke="#17141F" stroke-width="2"></rect>
+                <text x="50" y="118" font-family="Nunito, sans-serif" font-size="13" fill="#17141F" text-anchor="middle">Schritt 0</text>
+              </g>
+              <g transform="translate(100 0)">
+                <rect x="6" y="8" width="88" height="88" fill="#FFFCF3"></rect>
+                <use href="#face" x="0" y="0"></use>
+                <rect x="6" y="8" width="88" height="88" filter="url(#grain)" opacity="0.62"></rect>
+                <rect x="6" y="8" width="88" height="88" fill="none" stroke="#17141F" stroke-width="2"></rect>
+                <text x="50" y="118" font-family="Nunito, sans-serif" font-size="13" fill="#17141F" text-anchor="middle">Schritt 3</text>
+              </g>
+              <g transform="translate(200 0)">
+                <rect x="6" y="8" width="88" height="88" fill="#FFFCF3"></rect>
+                <use href="#face" x="0" y="0"></use>
+                <rect x="6" y="8" width="88" height="88" filter="url(#grain)" opacity="0.28"></rect>
+                <rect x="6" y="8" width="88" height="88" fill="none" stroke="#17141F" stroke-width="2"></rect>
+                <text x="50" y="118" font-family="Nunito, sans-serif" font-size="13" fill="#17141F" text-anchor="middle">Schritt 6</text>
+              </g>
+              <g transform="translate(300 0)">
+                <rect x="6" y="8" width="88" height="88" fill="#FFFCF3"></rect>
+                <use href="#face" x="0" y="0"></use>
+                <rect x="6" y="8" width="88" height="88" fill="none" stroke="#17141F" stroke-width="2"></rect>
+                <text x="50" y="118" font-family="Nunito, sans-serif" font-size="13" fill="#17141F" text-anchor="middle">fertig</text>
+              </g>
+            </svg>
+            <figcaption>Der Weg vom Flimmern zum Bild – bei uns in 8 Schritten.</figcaption>
+          </figure>
+        </article>
+      </div>
+
+      <div class="bubble">Beide KIs brauchen einen guten Auftrag von dir. Dieser Auftrag heißt <strong>Prompt</strong>.</div>
+    </section>
+
+    <!-- ============================================ 3 · Aufgabe 1 -->
+    <section class="slide" id="folie-3" hidden tabindex="-1" aria-label="Folie 3: Aufgabe 1">
+      <div class="caption">
+        <span class="kicker">AUFGABE 1</span>
+        <h2>Dein Lieblingsessen</h2>
+      </div>
+
+      <div class="grid two">
+        <article class="panel">
+          <h3>So geht’s</h3>
+          <ol class="steps">
+            <li>Denk an dein Lieblingsessen. Was liegt auf dem Teller?</li>
+            <li>Schreib einen kurzen Satz auf Englisch oder Deutsch – einfach drauflos.</li>
+            <li>Lass das Bild erzeugen und schau es dir genau an.</li>
+            <li>Schreib den Prompt noch einmal – diesmal mit mehr Details.</li>
+          </ol>
+        </article>
+
+        <article class="panel">
+          <h3>Vom kurzen zum genauen Prompt</h3>
+          <p class="tag">ERSTER VERSUCH</p>
+          <div class="prompt">Pizza</div>
+          <p class="tag">ZWEITER VERSUCH</p>
+          <div class="prompt">eine dampfende Pizza mit Basilikum auf einem Holzbrett,
+von oben fotografiert, warmes Licht, viele Details</div>
+          <div class="bubble">Je genauer du schreibst, desto näher kommt das Bild an deine Idee.</div>
+        </article>
+      </div>
+
+      <div class="strip">
+        <div><b>ZEIT</b><span>ca. 10 Minuten</span></div>
+        <div><b>SCHAU GENAU HIN</b><span>Was hat die KI dazu erfunden, was du gar nicht geschrieben hast?</span></div>
+      </div>
+    </section>
+
+    <!-- ============================================ 4 · Aufgabe 2 -->
+    <section class="slide" id="folie-4" hidden tabindex="-1" aria-label="Folie 4: Aufgabe 2">
+      <div class="caption">
+        <span class="kicker">AUFGABE 2</span>
+        <h2>Ein Bild von dir oder deiner besten Freundin</h2>
+      </div>
+
+      <div class="grid two">
+        <article class="panel">
+          <h3>So geht’s</h3>
+          <ol class="steps">
+            <li>Beschreibe nur mit Worten: Haare, Kleidung, Brille, Lieblingssache in der Hand.</li>
+            <li>Sag auch, wo die Person steht und was sie gerade macht.</li>
+            <li>Bild erzeugen lassen – und vergleichen: Was stimmt, was nicht?</li>
+            <li>Ändere genau eine Sache im Prompt und probiere es noch einmal.</li>
+          </ol>
+          <div class="bubble">Wichtig: Lade kein echtes Foto hoch. Wir beschreiben nur mit Worten.</div>
+        </article>
+
+        <article class="panel">
+          <h3>Beispiel</h3>
+          <div class="prompt">ein Mädchen, 13 Jahre, schwarze Locken mit rotem Stirnband,
+Jeanslatzhose voller Werkzeug, Lupe an einer Kette,
+steht in einer Werkstatt und lacht</div>
+          <p>Die KI hat dich noch nie gesehen. Sie baut aus deinen Worten eine <strong>Person, die dazu passt</strong> – aber nicht dich.</p>
+          <p>Deshalb sehen zwei Bilder mit demselben Prompt auch nie ganz gleich aus.</p>
+        </article>
+      </div>
+
+      <div class="strip">
+        <div><b>ZEIT</b><span>ca. 10 Minuten</span></div>
+        <div><b>SCHAU GENAU HIN</b><span>Welche Wörter haben das Bild am stärksten verändert?</span></div>
+      </div>
+    </section>
+
+    <!-- ============================================ 5 · Aufgabe 3 -->
+    <section class="slide" id="folie-5" hidden tabindex="-1" aria-label="Folie 5: Aufgabe 3">
+      <div class="caption">
+        <span class="kicker">AUFGABE 3</span>
+        <h2>Die Titelseite für dein Comic</h2>
+      </div>
+
+      <div class="grid two">
+        <article class="panel">
+          <h3>Das gehört auf eine Titelseite</h3>
+          <ul class="plain">
+            <li><strong>Wer</strong> ist die Heldin oder der Held?</li>
+            <li><strong>Wo</strong> spielt die Geschichte – Labor, Wald, Weltraum?</li>
+            <li><strong>Welche Stimmung</strong> hat sie: lustig, spannend, geheimnisvoll?</li>
+            <li>Ein <strong>Titel</strong>, groß und mutig oben auf der Seite.</li>
+          </ul>
+        </article>
+
+        <article class="panel">
+          <h3>Beispiel-Prompt</h3>
+          <div class="prompt">Comic-Titelseite, freundlicher Zeichenstil,
+klare schwarze Konturen, leuchtende Farben,
+ein Mädchen im Laborkittel und ein kleiner runder Roboter,
+oben ein großes Titelband: „Das Rätsel im Labor“</div>
+          <div class="bubble">Buchstaben sind für die Bild-KI richtig schwer. Wundere dich nicht über verdrehte Wörter!</div>
+        </article>
+      </div>
+
+      <div class="strip">
+        <div><b>ZEIT</b><span>ca. 15 Minuten</span></div>
+        <div><b>SCHAU GENAU HIN</b><span>Wie viele Versuche brauchst du, bis der Titel lesbar ist?</span></div>
+      </div>
+    </section>
+
+    <!-- ============================================ 6 · Aufgabe 4a -->
+    <section class="slide" id="folie-6" hidden tabindex="-1" aria-label="Folie 6: Aufgabe 4, Comicseite lesen">
+      <div class="caption">
+        <span class="kicker">AUFGABE 4</span>
+        <h2>Eine Comicseite lesen wie ein Profi</h2>
+      </div>
+
+      <div class="grid two">
+        <article class="panel">
+          <h3>Nimm eine einfache Comicseite und finde heraus:</h3>
+          <ol class="steps">
+            <li>Wie viele <strong>Panels</strong> (Kästen) hat die Seite?</li>
+            <li>In welcher <strong>Reihenfolge</strong> liest man sie? Male den Weg mit dem Finger nach.</li>
+            <li>Wer <strong>spricht</strong>? Sprechblasen zeigen mit ihrem Zipfel auf die Person.</li>
+            <li>Was steht im <strong>Erzähler-Kasten</strong> – meistens oben in der Ecke?</li>
+            <li>Was passiert <strong>zwischen</strong> zwei Panels? Das denkt sich dein Kopf dazu.</li>
+          </ol>
+        </article>
+
+        <article class="panel">
+          <h3>Die Bauteile einer Seite</h3>
+          <figure>
+            <svg viewBox="0 0 400 230" role="img" aria-label="Schema einer Comicseite mit vier Panels, Erzähler-Kasten, Sprechblase und weißen Zwischenräumen.">
+              <rect x="0" y="0" width="400" height="230" fill="#FFFFFF"></rect>
+              <rect x="14" y="14" width="176" height="94" fill="#FFFCF3" stroke="#17141F" stroke-width="3"></rect>
+              <rect x="210" y="14" width="176" height="94" fill="#FFFCF3" stroke="#17141F" stroke-width="3"></rect>
+              <rect x="14" y="126" width="176" height="90" fill="#FFFCF3" stroke="#17141F" stroke-width="3"></rect>
+              <rect x="210" y="126" width="176" height="90" fill="#FFFCF3" stroke="#17141F" stroke-width="3"></rect>
+              <rect x="22" y="22" width="112" height="24" fill="#FFC93C" stroke="#17141F" stroke-width="2"></rect>
+              <text x="30" y="39" font-family="Nunito, sans-serif" font-size="13" font-weight="700" fill="#17141F">Erzähler-Kasten</text>
+              <rect x="238" y="30" width="120" height="40" rx="18" fill="#FFFFFF" stroke="#17141F" stroke-width="2"></rect>
+              <path d="M262 70 L256 86 L282 70 Z" fill="#FFFFFF" stroke="#17141F" stroke-width="2"></path>
+              <text x="252" y="56" font-family="Nunito, sans-serif" font-size="13" font-weight="700" fill="#17141F">Sprechblase</text>
+              <text x="196" y="122" font-family="Nunito, sans-serif" font-size="12" fill="#6F6A7A" text-anchor="middle">Zwischenraum</text>
+              <path d="M110 60 L300 60" stroke="#0E9FD4" stroke-width="3" stroke-dasharray="7 6" fill="none"></path>
+              <path d="M300 60 L60 170 L300 170" stroke="#0E9FD4" stroke-width="3" stroke-dasharray="7 6" fill="none"></path>
+              <circle cx="300" cy="170" r="7" fill="#E6376F" stroke="#17141F" stroke-width="2"></circle>
+              <text x="30" y="205" font-family="Nunito, sans-serif" font-size="13" fill="#0E9FD4" font-weight="700">Leserichtung</text>
+            </svg>
+            <figcaption>Gelesen wird wie ein Text: oben links beginnen, unten rechts aufhören.</figcaption>
+          </figure>
+        </article>
+      </div>
+
+      <div class="strip">
+        <div><b>ZEIT</b><span>ca. 15 Minuten</span></div>
+        <div><b>MERKE</b><span>Erzähler-Text: höchstens 15 Wörter. Sprechblase: höchstens 12 Wörter – sonst passt er nicht hinein.</span></div>
+      </div>
+    </section>
+
+    <!-- ============================================ 7 · Aufgabe 4b -->
+    <section class="slide" id="folie-7" hidden tabindex="-1" aria-label="Folie 7: Die sechs Schritte in der App">
+      <div class="caption">
+        <span class="kicker">AUFGABE 4 · TEIL 2</span>
+        <h2>Die 6 Schritte im Comic Maker</h2>
+      </div>
+
+      <div class="tabs">
+        <div class="tabstep"><span class="no">1</span><div><h4>Creator</h4><p>Künstlername und Kürzel eintragen. Dann dein Signatur-Logo erzeugen lassen – das kommt später in die Ecke der Seite.</p></div></div>
+        <div class="tabstep"><span class="no">2</span><div><h4>Characters</h4><p>1 bis 3 Figuren beschreiben: Name, Aussehen, Eigenschaften. Je genauer das Aussehen, desto ähnlicher sehen die Figuren auf jedem Panel aus.</p></div></div>
+        <div class="tabstep"><span class="no">3</span><div><h4>Scene</h4><p>Wo spielt die Geschichte? Wie fängt sie an, wie endet sie? Panel-Anzahl wählen (4 bis 6) und das Drehbuch schreiben lassen.</p></div></div>
+        <div class="tabstep"><span class="no">4</span><div><h4>Script</h4><p>Das Drehbuch lesen und <strong>alles ändern, was dir nicht gefällt</strong>. Hier bist du die Autorin.</p></div></div>
+        <div class="tabstep"><span class="no">5</span><div><h4>Page</h4><p>Den Bild-Prompt prüfen – er steht als übersichtliche Liste da – und die Comic-Seite zeichnen lassen. Das dauert ein bis zwei Minuten.</p></div></div>
+        <div class="tabstep"><span class="no">6</span><div><h4>Export</h4><p>Seite als PNG oder PDF speichern und ausdrucken. Deine Signatur steht unten drauf.</p></div></div>
+      </div>
+
+      <div class="strip">
+        <div><b>TIPP</b><span>Du kannst jederzeit zurückgehen und etwas ändern. Nichts geht dabei kaputt.</span></div>
+      </div>
+    </section>
+
+    <!-- ============================================ 8 · Aufgabe 5 -->
+    <section class="slide" id="folie-8" hidden tabindex="-1" aria-label="Folie 8: Aufgabe 5, eigenes Comic">
+      <div class="caption">
+        <span class="kicker">AUFGABE 5</span>
+        <h2>Dein eigenes Comic</h2>
+      </div>
+
+      <div class="grid three">
+        <article class="panel cyan">
+          <h3>1 · Die Idee</h3>
+          <ul class="plain">
+            <li>Wer ist dabei?</li>
+            <li>Wo spielt es?</li>
+            <li>Welches Problem gibt es?</li>
+            <li>Wie wird es gelöst?</li>
+          </ul>
+        </article>
+        <article class="panel magenta">
+          <h3>2 · Das Bauen</h3>
+          <ul class="plain">
+            <li>Alle 6 Schritte durchgehen</li>
+            <li>Drehbuch verbessern</li>
+            <li>Texte kurz halten</li>
+            <li>Ruhig zweimal zeichnen lassen</li>
+          </ul>
+        </article>
+        <article class="panel mint">
+          <h3>3 · Das Zeigen</h3>
+          <ul class="plain">
+            <li>Seite exportieren</li>
+            <li>Ausdrucken</li>
+            <li>Der Gruppe vorstellen</li>
+            <li>In einem Satz sagen, worum es geht</li>
+          </ul>
+        </article>
+      </div>
+
+      <div class="bubble">Deine Geschichte muss nicht perfekt sein. Sie muss <strong>deine</strong> sein.</div>
+
+      <div class="strip">
+        <div><b>ZEIT</b><span>ca. 45 Minuten</span></div>
+        <div><b>ZIEL</b><span>Eine fertige Comic-Seite mit 4 bis 6 Panels und deiner Signatur.</span></div>
+      </div>
+    </section>
+
+    <!-- ============================================ 9 · Abschluss -->
+    <section class="slide" id="folie-9" hidden tabindex="-1" aria-label="Folie 9: Zusammenfassung">
+      <div class="caption">
+        <span class="kicker">ZUM SCHLUSS</span>
+        <h2>Das hast du heute geschafft</h2>
+      </div>
+
+      <div class="grid two">
+        <article class="panel">
+          <h3>Gelernt</h3>
+          <ul class="plain">
+            <li>Eine <strong>Sprach-KI</strong> rät Wort für Wort – daraus wird ein Drehbuch.</li>
+            <li>Eine <strong>Bild-KI</strong> nimmt Schritt für Schritt das Rauschen weg – daraus wird ein Bild.</li>
+            <li>Ein guter <strong>Prompt</strong> ist genau, kurz und sagt auch den Stil.</li>
+            <li>Eine Comicseite besteht aus Panels, Sprechblasen und Erzähler-Kästen.</li>
+          </ul>
+        </article>
+
+        <article class="panel">
+          <h3>Gemacht</h3>
+          <ul class="plain">
+            <li>Ein Bild von deinem Lieblingsessen</li>
+            <li>Ein Bild aus deiner eigenen Beschreibung</li>
+            <li>Eine Comic-Titelseite</li>
+            <li>Eine Comicseite genau untersucht</li>
+            <li>Ein eigenes Comic gebaut und gedruckt</li>
+          </ul>
+        </article>
+      </div>
+
+      <div class="bubble">Die KI zeichnet und schreibt. Aber die Idee, die Auswahl und das letzte Wort – das bist <strong>du</strong>.</div>
+
+      <div class="strip">
+        <div><b>DANKE</b><span>Elisabeth Milde und Jan-Torsten Milde · MINT-Labortage 2026 · Hochschule Fulda</span></div>
+      </div>
+    </section>
+
+  </main>
+
+  <nav class="controls" aria-label="Foliensteuerung">
+    <button type="button" id="prev">◀ Zurück</button>
+    <div class="dots" id="dots"></div>
+    <span class="counter" id="counter">Folie 1 / 9</span>
+    <button type="button" id="next">Weiter ▶</button>
+  </nav>
+</div>
+
+<script>
+  (function () {
+    var slides = Array.prototype.slice.call(document.querySelectorAll('.slide'));
+    var prev = document.getElementById('prev');
+    var next = document.getElementById('next');
+    var counter = document.getElementById('counter');
+    var dotBar = document.getElementById('dots');
+    var current = 0;
+    var dots = slides.map(function (slide, i) {
+      var dot = document.createElement('button');
+      dot.type = 'button';
+      dot.setAttribute('aria-label', 'Folie ' + (i + 1));
+      dot.addEventListener('click', function () { show(i, true); });
+      dotBar.appendChild(dot);
+      return dot;
+    });
+
+    function show(index, focus) {
+      current = Math.max(0, Math.min(slides.length - 1, index));
+      slides.forEach(function (slide, i) { slide.hidden = i !== current; });
+      dots.forEach(function (dot, i) { dot.setAttribute('aria-current', String(i === current)); });
+      counter.textContent = 'Folie ' + (current + 1) + ' / ' + slides.length;
+      prev.disabled = current === 0;
+      next.disabled = current === slides.length - 1;
+      history.replaceState(null, '', '#' + slides[current].id);
+      if (focus) { slides[current].focus({ preventScroll: true }); }
+      window.scrollTo({ top: 0, behavior: 'instant' in window ? 'instant' : 'auto' });
+    }
+
+    prev.addEventListener('click', function () { show(current - 1, true); });
+    next.addEventListener('click', function () { show(current + 1, true); });
+
+    document.addEventListener('keydown', function (event) {
+      if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
+        show(current + 1, true); event.preventDefault();
+      } else if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
+        show(current - 1, true); event.preventDefault();
+      } else if (event.key === 'Home') {
+        show(0, true); event.preventDefault();
+      } else if (event.key === 'End') {
+        show(slides.length - 1, true); event.preventDefault();
+      }
+    });
+
+    var start = slides.findIndex(function (slide) { return '#' + slide.id === location.hash; });
+    show(start > -1 ? start : 0, false);
+  })();
+</script>
