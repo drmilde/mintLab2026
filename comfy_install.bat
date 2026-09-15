@@ -1,4 +1,4 @@
-mkdir comdy
+mkdir comfy
 cd comfy
 python -m venv venv
 .\venv\Scripts\activate.bat
